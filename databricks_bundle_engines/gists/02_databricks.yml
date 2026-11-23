@@ -1,0 +1,27 @@
+bundle:
+  name: my-bundle
+
+include:
+  - ./resources/*.yml
+
+artifacts:
+  my_module:
+    type: whl
+    build: uv build
+    path: .
+
+targets:
+  tf:
+    mode: development
+    default: true
+    workspace:
+      host: https://<my-workspace>.cloud.databricks.com/
+    presets:
+      name_prefix: "[tf ${workspace.current_user.short_name}] "
+
+  direct:
+    mode: development
+    workspace:
+      host: https://<my-workspace>.cloud.databricks.com/
+    presets:
+      name_prefix: "[direct ${workspace.current_user.short_name}] "
