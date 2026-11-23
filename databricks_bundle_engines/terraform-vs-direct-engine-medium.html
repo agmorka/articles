@@ -8,7 +8,7 @@
 
 <h1>Terraform engine vs direct engine: what Databricks bundles really remember</h1>
 
-<p><em>[Medium subtitle, optional: Migrating Declarative Automation Bundles from the Terraform engine to the direct engine, and what can break along the way]</em></p>
+<p><em>Your bundle may remember a setting that your config doesn't, and the direct engine will reset it</em></p>
 
 <p>My team uses an old version of the Databricks CLI. We have to migrate our Declarative Automation Bundles from the Terraform engine to the direct engine. (Yes, Declarative Automation Bundles is the new name for Databricks Asset Bundles. If you blinked, you missed the rename. The good news: they're still DABs.) And if we upgrade the CLI, the migration happens on its own, on the next deploy. Before that happens, I want to understand what actually changes with this migration and what can break. So I dug into how both engines work.</p>
 
