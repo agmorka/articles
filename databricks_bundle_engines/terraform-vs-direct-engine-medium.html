@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Terraform engine vs direct engine: what Databricks bundles really remember</title>
+</head>
+<body>
+
+<h1>Terraform engine vs direct engine: what Databricks bundles really remember</h1>
+
+<p><em>[Medium subtitle, optional: Migrating Declarative Automation Bundles from the Terraform engine to the direct engine, and what can break along the way]</em></p>
+
+<p>My team uses an old version of the Databricks CLI. We have to migrate our Declarative Automation Bundles from the Terraform engine to the direct engine. (Yes, Declarative Automation Bundles is the new name for Databricks Asset Bundles. If you blinked, you missed the rename. The good news: they're still DABs.) And if we upgrade the CLI, the migration happens on its own, on the next deploy. Before that happens, I want to understand what actually changes with this migration and what can break. So I dug into how both engines work.</p>
+
+<p><strong>TL;DR:</strong> For most job settings, the two engines behave the same, even when you remove a field. The direct engine is faster and doesn't need to download Terraform. The real risk is a value that only the workspace remembers: the Terraform engine leaves it alone, and the first deploy on the direct engine resets it to the default without a warning. <code>bundle plan -o json</code> shows it before it happens.</p>
+
+<p>If you only came for the migration, jump to the checklist near the end: "What I'd check before migrating a real bundle". It's a list of things to look at before you plan, not a migration plan, so treat it as a starting point for your own.</p>
+
+<p>A short timeline (this is the only bit of history here, no worries):</p>
+
+<ul>
+<li><strong>0.279.0</strong>: the Databricks CLI supports two deployment engines, <em>terraform</em> and <em>direct</em></li>
+<li><strong>1.2.1</strong>: the last version with the Terraform engine as the default (our version)</li>
+<li><strong>1.3.0</strong>: the direct engine becomes the default for new bundles</li>
+<li><strong>1.14</strong>: existing bundles are migrated to the direct engine automatically on deploy</li>
+<li><strong>1.20.0</strong>: the Terraform engine is removed, so direct is the only deployment engine</li>
+<li><strong>1.26.0</strong>: the latest version, released in November 2026</li>
+</ul>
+
+<h2>How each engine deploys your bundle</h2>
+
+<p>According to the <a href="https://learn.microsoft.com/en-us/azure/databricks/dev-tools/cli/migrate">official documentation</a>, the Databricks CLI has been a single Go binary since version 0.205 (a looooong time ago, in September 2023). Both engines live inside that binary. The difference is what the binary calls next.</p>
+
+<p>The Terraform engine, obviously, uses Terraform. By default, it requires Terraform version 1.5.5 and runs it together with the Databricks Terraform provider. On deploy, the CLI first looks for Terraform. If it doesn't find a matching version, it downloads that exact Terraform version into a private bin folder in the bundle's cache, under <code>.databricks/</code> in your project. It doesn't use or touch any Terraform you might have installed system-wide. Terraform then fetches the Databricks Terraform provider the same way.</p>
+
+<p>The exception is restricted networks. In an air-gapped environment, the automatic download fails, so you download Terraform and the provider manually and point the CLI to them with the <code>DATABRICKS_TF_*</code> environment variables. The versions you declare there have to match the ones the CLI expects. One air-gapped user wrote in a <a href="https://github.com/databricks/databricks-vscode/issues/911">GitHub issue</a> that installing Terraform was fine, but installing the provider offline was cumbersome.</p>
+
+<p>I ran the <code>databricks bundle debug terraform</code> command to check which Terraform and provider versions the Databricks CLI will use.</p>
+
+<p>[IMAGE: output of databricks bundle debug terraform, not in pics folder, insert from Notion]</p>
+
+<p>The direct engine calls the APIs directly. (The name gives it away.) Neither Terraform nor the Databricks Terraform provider is needed. According to the Databricks documentation, bundle deployments are up to 40% faster. Both paths in one picture:</p>
+
+<p>[IMAGE: 01_terraform_vs_direct_engine.png]</p>
+
+<h2>The test setup: a minimal bundle tracked in Git</h2>
+
+<p>Before touching anything at work, I wanted a safe place to break things. So I built the smallest bundle that mimics our real bundles. It contains one job and one Python package. The job runs a Python wheel task, and on every deploy the bundle builds the wheel for <code>my_module</code> with <code>uv build</code>. The job runs on serverless, so there's no cluster config to deal with. The whole example is on GitHub: <a href="https://github.com/agmorka/databricks-bundle-engines">agmorka/databricks-bundle-engines</a>.</p>
+
+<p>My bundle has two identical targets, <code>tf</code> and <code>direct</code>, one for each engine. Each target keeps its own state under <code>.databricks/bundle/&lt;target&gt;/</code>, so I can deploy the same job with both engines and put the results side by side. CLI version 1.2.1 already includes the direct engine, so I picked the engine per command with an environment variable (in PowerShell; in bash, it's <code>DATABRICKS_BUNDLE_ENGINE=direct databricks bundle deploy -t direct</code>):</p>
+
+<pre><code># terraform engine
+databricks bundle deploy -t tf
+# direct engine
+$env:DATABRICKS_BUNDLE_ENGINE="direct"; databricks bundle deploy -t direct; Remove-Item Env:DATABRICKS_BUNDLE_ENGINE
+</code></pre>
+
+<p>I also turned the project folder into a Git repository with <code>git init</code>. That's what makes the experiments easy to follow. The CLI keeps its deployment state in a hidden <code>.databricks/</code> folder inside the project. If I commit after every deploy, <code>git diff</code> shows how each deploy changed those files. (There's one catch: by default, Git doesn't see these files at all. I'll explain why after the first deploy.)</p>
+
+<p>The plan:</p>
+
+<ol>
+<li>Deploy the bundle to both targets in Databricks Free with CLI <strong>1.2.1</strong>: <code>tf</code> with the Terraform engine, <code>direct</code> with the direct engine. Then compare the state files locally and in the workspace.</li>
+<li>Add a setting to the job and deploy both targets. Then remove it, deploy again, and check what each engine leaves in the workspace.</li>
+<li>Upgrade the CLI and migrate the <code>tf</code> target to the direct engine.</li>
+</ol>
+
+<p>The bundle structure:</p>
+
+<p>[IMAGE: 02_project_structure.png]</p>
+
+<p><code>databricks.yml</code> defines the bundle, the wheel artifact and the two targets:</p>
+
+<pre><code>bundle:
+  name: my-bundle
+
+include:
+  - ./resources/*.yml
+
+artifacts:
+  my_module:
+    type: whl
+    build: uv build
+    path: .
+
+targets:
+  tf:
+    mode: development
+    default: true
+    workspace:
+      host: https://&lt;my-workspace&gt;.cloud.databricks.com/
+    presets:
+      name_prefix: "[tf ${workspace.current_user.short_name}] "
+
+  direct:
+    mode: development
+    workspace:
+      host: https://&lt;my-workspace&gt;.cloud.databricks.com/
+    presets:
+      name_prefix: "[direct ${workspace.current_user.short_name}] "
+</code></pre>
+
+<p><code>resources/my_job.yml</code> defines the job:</p>
+
+<pre><code>resources:
+  jobs:
+    my_job:
+      name: my_job
+      tasks:
+        - task_key: hello
+          environment_key: default
+          python_wheel_task:
+            package_name: my_module
+            entry_point: hello
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../dist/*.whl
+</code></pre>
+
+<p>Notes on the config:</p>
+
+<ul>
+<li><strong>The <code>artifacts</code> block</strong> tells the CLI to build the wheel with <code>uv build</code> before every deploy. The result lands in the <code>dist/</code> folder of the project.</li>
+<li><strong>The <code>../dist/*.whl</code> dependency</strong> points the job to that wheel. On every deploy, the CLI uploads the wheel to the workspace and rewrites the path, so the job uses the uploaded copy. That's why the wheel shows up among the deployed files, and why the path in the state files looks different from the one in my YAML.</li>
+<li><strong><code>mode: development</code></strong> deploys everything to your user folder, and <strong><code>presets.name_prefix</code></strong> replaces its default <code>[dev &lt;your user&gt;]</code> prefix with <code>[tf &lt;your user&gt;]</code> or <code>[direct &lt;your user&gt;]</code>. That's how I tell the two copies of the job apart in the workspace. (The username has to stay in the prefix: with <code>mode: development</code>, <code>bundle validate</code> refuses a prefix without it, so two developers can't overwrite each other's jobs.)</li>
+<li><strong>The resource key <code>my_job</code></strong> is how the job is identified in the deployment state: in <code>bundle.tf.json</code> and <code>terraform.tfstate</code> for the <code>tf</code> target, and in the direct engine's state file for the <code>direct</code> target. Watch for it in the diffs.</li>
+</ul>
+
+<p>Before deploying anything, I validated the bundle.</p>
+
+<p>[IMAGE: 03_validate-both-targets.png]</p>
+
+<h2>First deploy: what each engine leaves behind</h2>
+
+<h3>The deploy itself</h3>
+
+<p>I deployed the same bundle twice: first to the <code>tf</code> target with the default Terraform engine, then to the <code>direct</code> target with <code>DATABRICKS_BUNDLE_ENGINE=direct</code>. After each deploy, I committed everything, so each commit holds what one engine created.</p>
+
+<p>Both engines print the same deployment log. First, the CLI builds the wheel. Then it uploads all bundle files, including the wheel, to the workspace. Finally, it deploys the resources and updates the deployment state. Compare the two logs below: apart from the target name, the lines are the same.</p>
+
+<p>[IMAGE: deployment log for tf, not in pics folder, insert from Notion]</p>
+
+<p>[IMAGE: deployment log for direct, not in pics folder, insert from Notion]</p>
+
+<p>The first deploy took 30 s for <code>tf</code> and 12 s for <code>direct</code>. That's not quite fair, because the first <code>tf</code> deploy also downloads Terraform and the provider. So I ran a second deploy with no changes: 17 s vs 11 s. That points in the same direction as the "up to 40%" Databricks mentions, but two runs are not enough to say how large the difference really is.</p>
+
+<p>[IMAGE: 04_deploy-timing-tf.png]</p>
+
+<p>[IMAGE: 05_deploy-timing-direct.png]</p>
+
+<p>[IMAGE: 06_deploy-timing-tf-nochange.png]</p>
+
+<p>[IMAGE: 07_deploy-timing-direct-nochange.png]</p>
+
+<p>During that no-change deploy, my first try with the Terraform engine failed before it touched anything: <code>terraform init</code> couldn't reach <code>registry.terraform.io</code>. The provider was already on my disk, and the lock file pinned its exact version, but Terraform still went to the registry. The second try worked. So the Terraform engine needs the internet on every deploy, not only the first one. The direct engine never talks to the Terraform registry at all.</p>
+
+<p>[IMAGE: registry error, not in pics folder, insert from Notion]</p>
+
+<p>[IMAGE: retry that went through, not in pics folder, insert from Notion]</p>
+
+<h3>Locally: what appears in .databricks/</h3>
+
+<p>The deploy created two folders in my project: the hidden <code>.databricks/</code> folder with the CLI's working data, and <code>dist/</code>, where the built wheel lands by default. The CLI puts a <code>.gitignore</code> file in both folders, so Git ignores them. That's a sensible default for real projects, but here I want to see every change, so I deleted both files. (Don't do this in your real project.)</p>
+
+<p>[IMAGE: 08_project_structure_after_deployment.png]</p>
+
+<p>What each engine created:</p>
+
+<ul>
+<li><strong><code>deployment.json</code></strong> (both engines): deployment bookkeeping, with the CLI version, a timestamp and the local files included in the bundle</li>
+<li><strong><code>sync-snapshots/</code></strong> (both engines): snapshot used by file synchronization</li>
+<li><strong><code>bin/terraform.exe</code></strong> (tf only): Terraform, downloaded for this bundle</li>
+<li><strong><code>terraform/</code></strong> (tf only): generated Terraform config (<code>bundle.tf.json</code>), plan and <code>terraform.tfstate</code></li>
+<li><strong><code>resources.json</code></strong> (direct only): deployment state file</li>
+</ul>
+
+<h3>The state files side by side</h3>
+
+<p>Both engines deployed the same job, so I expected the state to look similar, but the two files have little in common.</p>
+
+<p>[IMAGE: 09_terraform_state_vs_resources_json.png]</p>
+
+<p>Some quick numbers: for one tiny job, <code>terraform.tfstate</code> has 183 lines, and the direct engine's state file, <code>resources.json</code>, has 48.</p>
+
+<ul>
+<li>Terraform's state holds every attribute the provider knows, mostly empty (<code>dbt_task: []</code>, <code>budget_policy_id: null</code>…), plus what the API returned (<code>id</code>, <code>url</code>, <code>run_as</code>, <code>provider_config</code>). It also has a <code>private</code> base64 blob, which decodes to timeouts and the schema version.</li>
+<li>The direct engine's state holds the job <em>as the CLI sends it to the API</em>: my YAML plus what the CLI added. That's the name prefix, the wheel path rewritten to the workspace, the <code>deployment</code> block, <code>edit_mode: UI_LOCKED</code>, <code>queue</code>, <code>format: MULTI_TASK</code>, the <code>dev</code> tag and <code>max_concurrent_runs: 4</code>. What it doesn't have: empty fields, the URL, or <code>run_as</code>.</li>
+<li>I never wrote <code>max_concurrent_runs</code> anywhere. That 4 and the <code>dev</code> tag come from <code>mode: development</code>, and they're in the Terraform state too.</li>
+<li>The resource key <code>my_job</code> appears in both, but in a different shape. In <code>terraform.tfstate</code>, the job is a resource with <code>"type": "databricks_job"</code> and <code>"name": "my_job"</code>, and its ID is one attribute among many. In <code>resources.json</code>, the key is the full bundle path <code>resources.jobs.my_job</code> (the same path you use in <code>${resources.jobs.my_job.id}</code>), and the ID sits next to the config as <code>__id__</code>.</li>
+</ul>
+
+<p>This matches what the Databricks documentation says: Terraform keeps a single state that mixes your local configuration with the remote state, while the direct engine records only your local configuration. With one nuance: "local configuration" means the configuration after the CLI has processed it, not literally my YAML file. The values from <code>mode: development</code> are in there too, but nothing the API returned except the ID.</p>
+
+<h3>In the workspace: the state folder</h3>
+
+<p>The bundle files and the wheel were uploaded to <code>.bundle/my-bundle/&lt;target&gt;/</code> in my user folder, one folder per target. And both jobs showed up in the workspace: <code>[tf agkepkowska] my_job</code> and <code>[direct agkepkowska] my_job</code>.</p>
+
+<p>[IMAGE: 10_bundle_folder_workspace.png]</p>
+
+<p>[IMAGE: 11_jobs_in_workspace.png]</p>
+
+<p>For <code>tf</code>, the <code>state</code> folder contains three files. <code>terraform.tfstate</code> and <code>deployment.json</code> are copies of the local files. <code>metadata.json</code> is new: the CLI writes it after a successful deployment, with a summary of what was deployed. It gives the deployment its identity, and together with <code>terraform.tfstate</code>, it lets the next deploy update only what changed.</p>
+
+<p>[IMAGE: 12_tf_state_folder_workspace.png]</p>
+
+<p>For <code>direct</code>, the <code>state</code> folder also contains three files. Two of them are the same as in the <code>tf</code> folder: <code>deployment.json</code> and <code>metadata.json</code>. <code>terraform.tfstate</code> is replaced with <code>resources.json</code>.</p>
+
+<p>[IMAGE: 13_direct_state_folder_workspace.png]</p>
+
+<p>The remote copy matters because a deploy from another machine or from a CI pipeline can pick up the state from the workspace. Your local <code>.databricks/</code> folder isn't the only source of truth.</p>
+
+<p>Finally, I compared the two deployed jobs with <code>databricks jobs get</code>. They're identical. The only differences are the ones that have to be there: <code>job_id</code>, <code>created_time</code>, the name prefix, and the two workspace paths that contain the target name (<code>metadata_file_path</code> and the wheel dependency). Everything else matches, including <code>edit_mode</code>, <code>format</code>, <code>queue</code>, <code>max_concurrent_runs: 4</code> and the task itself. So the workspace sees the same job. The difference is only in what each engine <em>remembers</em>.</p>
+
+<p>[IMAGE: 14_jobs-get-diff.png]</p>
+
+<h3>Summary</h3>
+
+<ul>
+<li><strong>Extra downloads:</strong> Terraform engine: Terraform 1.5.5 and the Databricks Terraform provider (1.117.0). Direct engine: none.</li>
+<li><strong>Local state file:</strong> Terraform engine: <code>terraform/terraform.tfstate</code>. Direct engine: <code>resources.json</code>.</li>
+<li><strong>What the state contains:</strong> Terraform engine: every attribute the provider knows (mostly empty), plus what the API returned: ID, URL, <code>run_as</code>. Direct engine: the job as the CLI sends it to the API, plus the job ID.</li>
+<li><strong>Remote state files:</strong> Terraform engine: <code>terraform.tfstate</code>, <code>deployment.json</code>, <code>metadata.json</code>. Direct engine: <code>resources.json</code>, <code>deployment.json</code>, <code>metadata.json</code>.</li>
+<li><strong>Deploy time (first / no changes):</strong> Terraform engine: 30 s / 17 s. Direct engine: 12 s / 11 s.</li>
+<li><strong>Deployed job:</strong> identical in both, apart from the name, ID and target-specific paths.</li>
+</ul>
+
+<p>So far, both jobs look the same in the workspace.</p>
+
+<h2>Removing a setting: do the engines behave differently?</h2>
+
+<p>This is the experiment I was most curious about. The Databricks documentation says the two engines handle a removed setting differently:</p>
+
+<blockquote>
+With the Terraform engine, removing a set field from your databricks.yml leaves the corresponding value unchanged in the platform. […] With the direct engine, removing a set field from your databricks.yml reverts the value to the resource's default.
+<br>— <a href="https://learn.microsoft.com/en-us/azure/databricks/dev-tools/bundles/direct">Databricks docs: Migrate to the direct deployment engine</a>
+</blockquote>
+
+<p>This kind of change doesn't break anything loudly. A job just starts behaving differently.</p>
+
+<p>I tested this with <code>timeout_seconds</code>. Development mode doesn't touch it (unlike <code>max_concurrent_runs</code>, which it already sets to 4), and its default is <code>0</code>, which means no timeout.</p>
+
+<p>I had to run this experiment twice, with two different fields, before I saw the difference the docs describe.</p>
+
+<p>Before starting, I committed everything from the first deploy, so each of the following steps has its own commit.</p>
+
+<h3>Step 1: adding the setting</h3>
+
+<p>I added one line to <code>resources/my_job.yml</code>:</p>
+
+<pre><code>resources:
+  jobs:
+    my_job:
+      name: my_job
+      timeout_seconds: 3600
+      tasks:
+        ...
+</code></pre>
+
+<p>Then I deployed both targets and checked the jobs (<code>$tfJob</code> and <code>$directJob</code> hold the two job IDs, which <code>bundle summary</code> prints):</p>
+
+<pre><code>databricks jobs get $tfJob | Select-String timeout_seconds
+databricks jobs get $directJob | Select-String timeout_seconds
+</code></pre>
+
+<p>Adding a field works the same way on both engines, so nothing surprising here. In the state files, <code>timeout_seconds</code> changed from 0 to 3600 in <code>terraform.tfstate</code>, and a new <code>timeout_seconds</code> line appeared in <code>resources.json</code>.</p>
+
+<p>[IMAGE: 15_tf-state-diff.png]</p>
+
+<p>[IMAGE: 16_direct-state-diff.png]</p>
+
+<p>The direct engine's diff is what I expected: one new line, <code>"timeout_seconds": 3600</code>, and <code>serial</code> going from 1 to 2. The Terraform diff is busier. It contains three kinds of changes, and only one of them is mine.</p>
+
+<ul>
+<li><strong>The change I made:</strong> <code>timeout_seconds</code> went from <code>0</code> to <code>3600</code>. Terraform already stored the default <code>0</code> before, even though I never wrote it, so it shows up as a changed value, not a new line.</li>
+<li><strong>Changes I didn't make:</strong> <code>java_dependencies</code> went from <code>null</code> to <code>[]</code>, <code>named_parameters</code> from <code>null</code> to <code>{}</code>, and <code>parameters</code> from <code>null</code> to <code>[]</code>. Nothing changed in the workspace here: these are just different ways of saying "empty". After the update, the provider read the job back from the API and stored those empty values in a slightly different form than after the first deploy. Terraform's state reflects the provider's view of the job, not my configuration, so it can change in places I never touched.</li>
+<li><strong>The counter:</strong> <code>serial</code> jumped from 1 to 3, although I deployed only once. It isn't a deploy counter: it goes up every time Terraform saves a new version of the state, and this deploy saved it twice. The deploy counter is <code>seq</code> in <code>deployment.json</code>, and it went from 2 to 3.</li>
+</ul>
+
+<p>The direct engine's state changes only where my configuration changed. Terraform's state also changes in places I didn't touch.</p>
+
+<h3>Step 2: removing it</h3>
+
+<p>Then I deleted the line with the extra setting. Before deploying, I asked each engine what it was going to do:</p>
+
+<pre><code>databricks bundle plan -t tf
+$env:DATABRICKS_BUNDLE_ENGINE="direct"; databricks bundle plan -t direct -o json; Remove-Item Env:DATABRICKS_BUNDLE_ENGINE
+</code></pre>
+
+<p>The <code>tf</code> plan does report a change: an update of <code>my_job</code>. And that was the first surprise of this experiment, because according to the <a href="https://learn.microsoft.com/en-us/azure/databricks/dev-tools/bundles/direct#removed-configuration-settings">docs</a>, the Terraform engine should leave a removed field alone.</p>
+
+<p>[IMAGE: 17_plan-tf-retry-removed.png]</p>
+
+<p>The CLI regenerates <code>bundle.tf.json</code> from my bundle before every plan, and <code>timeout_seconds</code> is gone from it now.</p>
+
+<p>[IMAGE: 18_bundle-tf-json-diff.png]</p>
+
+<p>Terraform compares that config with its state, which still says <code>3600</code>. To see the result, I looked into the plan file Terraform saves in <code>.databricks/bundle/tf/terraform/plan</code>. It's a zip archive with a binary plan inside, so not something you open in a text editor, but the Terraform binary the CLI downloaded can print it with <code>terraform show plan</code>. It plans one change: <code>timeout_seconds</code> from <code>3600</code> to <code>null</code>. So Terraform plans to remove the timeout.</p>
+
+<p>The direct plan reports the same thing: <code>update jobs.my_job</code>, one resource to change. But with <code>-o json</code>, it also explains why, field by field, and no decoding is needed. The <code>changes</code> block lists every field where something differs, with what the engine is going to do about it:</p>
+
+<ul>
+<li><code>timeout_seconds</code>: <code>"action": "update"</code>, with <code>"old": 3600</code> (what the last deploy recorded in <code>resources.json</code>) and <code>"remote": 3600</code> (what the workspace has right now). There's no new value, because my config doesn't have the field any more. The job goes back to the default.</li>
+<li><strong>Everything else is skipped, with a reason.</strong> <code>email_notifications</code>, <code>webhook_notifications</code>, the task's <code>disabled</code> and its own <code>timeout_seconds: 0</code> are skipped as <code>"empty"</code>: the workspace returns them, but they're empty, so there's nothing to change. The task's <code>run_if: ALL_SUCCESS</code> is skipped as <code>"backend_default"</code>: a value the API fills in by itself.</li>
+</ul>
+
+<p>The plan puts three things next to each other: <code>old</code> is the snapshot from the last deploy, <code>remote</code> is what the API returns now, and <code>new_state</code> is my current configuration. So the direct engine <em>does</em> see all the defaults the API returns. It just doesn't store them, and it knows which ones to ignore.</p>
+
+<p>So both engines plan the same thing for this field: remove the timeout. The difference is how much they tell you. The direct engine explains its plan in readable JSON. The detailed Terraform plan isn't plain text, so to read it you need Terraform's own helper command: <code>terraform show plan</code>.</p>
+
+<p>[IMAGE: 19_direct-plan.png]</p>
+
+<p>Then I deployed both targets and checked the jobs again.</p>
+
+<p>Both jobs came back with <code>timeout_seconds: 0</code>, which means no timeout. The Terraform engine didn't keep the old value, although the docs say it should. It did what its plan said and removed the timeout, just like the direct engine. For this field, in my test with CLI 1.2.1, both engines behave the same. (Each job shows two <code>timeout_seconds</code> lines: the more indented one is the task's own timeout, the other one is the job-level setting I changed.)</p>
+
+<p>[IMAGE: 20_jobs-timeout.png]</p>
+
+<h3>What happened in the state files</h3>
+
+<p>The state files agree with the workspace. In <code>terraform.tfstate</code>, <code>timeout_seconds</code> went from <code>3600</code> back to <code>0</code>, and <code>serial</code> jumped by two again, from 3 to 5. In <code>resources.json</code>, the <code>timeout_seconds</code> line is gone, and <code>serial</code> went from 2 to 3.</p>
+
+<p>So both engines removed the timeout, each by comparing my new config with what it remembered. That didn't explain the sentence about the Terraform engine in the docs, so I ran a second experiment.</p>
+
+<h2>Second try: a computed field</h2>
+
+<p>My guess was that it depends on the field. Terraform doesn't treat every field the same way. The provider's schema marks some fields as <em>optional + computed</em>: the API may fill them in by itself, so when such a field is missing from the config, Terraform reads that as "keep whatever is there", not as "remove it". <code>timeout_seconds</code> isn't one of them. It's a plain optional field: only my config sets it, so removing it is a change.</p>
+
+<p>I didn't want to guess which fields are computed, and I didn't have to. The Terraform engine had already downloaded the provider, and Terraform can print its schema without going to the internet:</p>
+
+<pre><code>.databricks\bundle\tf\bin\terraform.exe "-chdir=.databricks\bundle\tf\terraform" providers schema -json
+</code></pre>
+
+<p>For <code>databricks_job</code>, the list is short. At the top level of the job, only two fields are optional + computed: <code>format</code> and <code>id</code>. The CLI always sets <code>format</code> itself, and <code>id</code> is the job ID, so I can't add and remove either of them. Inside a task, there are a few more, but most of them belong to classic clusters (<code>node_type_id</code>, <code>enable_elastic_disk</code>…) or JAR tasks. The one left for my serverless wheel task is <code>retry_on_timeout</code>. Its default is <code>false</code>, so I set it to <code>true</code> on the task:</p>
+
+<pre><code>      tasks:
+        - task_key: hello
+          environment_key: default
+          retry_on_timeout: true
+</code></pre>
+
+<p>Adding it worked the same way on both engines again. Both jobs got <code>true</code>, <code>retry_on_timeout</code> changed from <code>false</code> to <code>true</code> in <code>terraform.tfstate</code>, and a new line appeared in <code>resources.json</code>.</p>
+
+<p>Then I removed it and asked both engines for a plan. This time, they differ. The CLI removed the field from <code>bundle.tf.json</code>, like before, but Terraform says there's nothing to change. The direct engine plans an update of the job.</p>
+
+<p>[IMAGE: 21_tf-plan-and-bundle-diff-retry.png]</p>
+
+<p>[IMAGE: 22_plan-direct-retry-removed.png]</p>
+
+<p>The <code>tf</code> job still has <code>retry_on_timeout: true</code>. The <code>direct</code> job doesn't show the field at all, because <code>jobs get</code> leaves out fields that are at their default, so it's back to <code>false</code>. The state files show the same thing. The Terraform engine didn't touch <code>terraform.tfstate</code> at all during this deploy, so it still says <code>true</code>. In <code>resources.json</code>, the <code>retry_on_timeout</code> line is gone.</p>
+
+<p>[IMAGE: 23_jobs-retry-after-removal.png]</p>
+
+<p>So the docs are right, but only for some fields. For a plain optional field, like <code>timeout_seconds</code>, both engines remove it. For a field Terraform treats as computed, like <code>retry_on_timeout</code>, only the direct engine does. And in a job, almost every setting is the first kind.</p>
+
+<h2>What this means for a migration</h2>
+
+<p>Look at my <code>tf</code> job now. The bundle says nothing about <code>retry_on_timeout</code>, the workspace says <code>true</code>, and everything works. Imagine a cleanup PR removed that line a year ago as "unused". On the Terraform engine, nothing happens. After the migration, the first deploy on the direct engine sends that value back to its default, with no error.</p>
+
+<p>The plan shows this in advance. Before migrating, run <code>bundle plan</code> with the direct engine and look closely at every <code>update</code> you didn't expect. The JSON plan names the exact field. And the practical advice from the Databricks docs still holds: if you rely on a value, set it explicitly in your configuration. Don't rely on what was deployed before.</p>
+
+<p>In the next section, I upgrade the CLI and migrate the <code>tf</code> target, starting with the job that still has <code>retry_on_timeout: true</code>.</p>
+
+<h2>Migrating the tf target to the direct engine</h2>
+
+<p>So far, everything ran on CLI 1.2.1. Now it's time for the step my team has to take anyway: upgrade the CLI and move the <code>tf</code> target to the direct engine. The <code>direct</code> target is my control group. It has used the direct engine from the start, so after the migration, both targets should look the same.</p>
+
+<h3>Upgrading the CLI</h3>
+
+<p>I upgraded the CLI from 1.2.1 to 1.26.0.</p>
+
+<p>[IMAGE: 24_cli-upgrade-1.26.0.png]</p>
+
+<p>Remember the timeline from the beginning: from 1.14, the CLI migrates Terraform-engine bundles automatically on deploy, and from 1.20, the Terraform engine is gone. With a new CLI, the next deploy of the <code>tf</code> target would migrate it whether I wanted it or not. I didn't want the migration to happen as a side effect, so I did it step by step, the way the docs describe.</p>
+
+<h3>Step 1: migrating the state</h3>
+
+<pre><code>databricks bundle deployment migrate -t tf
+</code></pre>
+
+<p>This command converts <code>terraform.tfstate</code> into the direct engine's state file, <code>resources.json</code>. It works only on my machine: nothing changes in the workspace until the next deploy.</p>
+
+<p>[IMAGE: 25_migrate-tf.png]</p>
+
+<p>The migration changed two things in <code>.databricks/bundle/tf/</code>. There's a new <code>resources.json</code>, the same kind of state file the <code>direct</code> target has had from the start. And <code>terraform.tfstate</code> is gone: the CLI renamed it to <code>terraform.tfstate.backup</code>, replacing the backup Terraform keeps from its previous run. That backup is how you undo the migration, and the CLI even prints the exact steps. Everything else stayed where it was: the <code>terraform/</code> folder with <code>bundle.tf.json</code> and the provider, and the Terraform binary in <code>bin/</code>. Nothing removed them.</p>
+
+<p>The new <code>resources.json</code> has 48 lines, the same as the one in the <code>direct</code> target. And one thing is missing from it: <code>retry_on_timeout</code>. The docs say <code>migrate</code> reads IDs from the existing deployment, and that's what it did. It took the job ID from Terraform and built the rest from my current configuration. The <code>true</code> stored in <code>terraform.tfstate</code> didn't make it into the new file.</p>
+
+<p>[IMAGE: 26_migrate-commit-stat.png]</p>
+
+<h3>Step 2: the migrated state file</h3>
+
+<p>Now I have two <code>resources.json</code> files for the same job: one created by the migration, and one the direct engine has kept since the first deploy. Comparing them shows what the migration carried over from Terraform.</p>
+
+<p>[IMAGE: 27_resources-json-tf-vs-direct.png]</p>
+
+<p>The job itself is the same in both files. They differ only where they have to: the job ID, the name prefix and the two paths with the target name. So after the migration, the direct engine remembers my <code>tf</code> job the same way as the job it has managed from the start. Including the missing <code>retry_on_timeout</code>, as I noticed in the previous step.</p>
+
+<p>The top of the file is different:</p>
+
+<ul>
+<li><strong><code>lineage</code></strong> is the same ID as in <code>terraform.tfstate</code>. The migration didn't start a new state, it continued the history of the Terraform one.</li>
+<li><strong><code>serial</code></strong> is 9, so it continues Terraform's counter instead of starting from 1.</li>
+<li><strong><code>state_version</code></strong> is 3, and <strong><code>cli_version</code></strong> is <code>1.26.0</code>. The <code>direct</code> file still says 2 and <code>1.2.1</code>, because I haven't deployed it with the new CLI yet. The new CLI writes a newer version of the state format.</li>
+</ul>
+
+<h3>Step 3: the plan before the first direct deploy</h3>
+
+<p>According to the docs, <code>bundle plan</code> after the migration should succeed and show no changes. The docs also warn that it may show some changes anyway, because the old Terraform state contains fields the platform filled in after deployment. Those differences are harmless and disappear after the next deploy.</p>
+
+<p>My guess was that this plan wouldn't be empty, because of <code>retry_on_timeout</code>: the bundle doesn't have it, and the workspace still says <code>true</code>.</p>
+
+<p>And it wasn't. The output of <code>migrate</code> itself says there should be no actions planned, but the plan shows one: <code>update jobs.my_job</code>. The plain text doesn't say why, so I saved the JSON plan and searched it for <code>retry_on_timeout</code>. It shows up twice. First in the job as it is now in the workspace, with <code>"retry_on_timeout": true</code>. And then in the list of changes, as the reason for the update: <code>tasks[task_key='hello'].retry_on_timeout</code> with <code>"action": "update"</code> and <code>"remote": true</code>.</p>
+
+<p>There's no <code>old</code> value, because the migrated snapshot doesn't have the field, and no new value, because my config doesn't have it either. The direct engine compares the workspace (<code>true</code>) with what it expects (nothing, which means the default) and plans to bring the job back to <code>false</code>.</p>
+
+<p>This difference isn't harmless: it changes how the job behaves. In a real bundle with dozens of jobs, it would be one more <code>update</code> line among many, easy to wave through. Only the JSON plan tells you which field it is.</p>
+
+<p>[IMAGE: 28_plan-tf-after-migrate.png]</p>
+
+<h3>Step 4: the first deploy with the direct engine</h3>
+
+<p>The last step makes the migration final: the deploy writes the new state to the workspace.</p>
+
+<p>The deploy did what the plan said. The log shows one line about my job, <code>Updated jobs.my_job</code>, and nothing else: no warning, and no word about which field changed. Then I checked the job, and <code>retry_on_timeout</code> is gone. It's back to <code>false</code>, the default.</p>
+
+<p>[IMAGE: 29_deploy-tf-after-migrate.png]</p>
+
+<p>The deploy also finished the migration in the workspace. The remote <code>state</code> folder of the <code>tf</code> target now has <code>resources.json</code>, and <code>terraform.tfstate</code> is gone. In its place there's <code>terraform.tfstate.backup</code>, the same rename <code>migrate</code> did on my machine. <code>metadata.json</code> and <code>deployment.json</code> are still there. The <code>tf</code> folder now looks like the <code>direct</code> one, plus the backup.</p>
+
+<p>[IMAGE: 30_tf-remote-state-after-migrate.png]</p>
+
+<h2>What I'd check before migrating a real bundle</h2>
+
+<p>Migrating one target took me around 5 minutes, including double-checking everything. So the effort is small, and the only risk I found is the silent reset. After this experiment, this is my list:</p>
+
+<ul>
+<li><strong>Pin the CLI version.</strong> From 1.14, a simple upgrade migrates the bundle on the next deploy, so decide when to migrate before you upgrade.</li>
+<li><strong>Deploy with the Terraform engine first,</strong> so the state is up to date.</li>
+<li><strong>Migrate one target at a time,</strong> starting with the least risky one.</li>
+<li><strong>Run <code>migrate</code> on its own and commit the result.</strong> Until the next deploy, nothing has changed in the workspace, and <code>terraform.tfstate.backup</code> is your way back.</li>
+<li><strong>Don't trust "there should be no actions planned".</strong> Run <code>bundle plan -o json</code> and explain every <code>update</code> before you deploy. A field with a <code>remote</code> value but no <code>old</code> one is a value that only the workspace remembers, like my <code>retry_on_timeout</code>. The deploy will reset it to the default.</li>
+<li><strong>Set every value you rely on explicitly in the config.</strong> If the plan shows a value you want to keep, add it to the bundle before the first deploy on the direct engine.</li>
+<li><strong>After the deploy, check the jobs you care about with <code>jobs get</code>,</strong> not only the deploy log. The log says <code>Updated</code>, but not what changed.</li>
+</ul>
+
+<h2>What I learned</h2>
+
+<p>So what actually changes with the migration, and what can break?</p>
+
+<ul>
+<li><strong>Both engines deploy the same job but store different state.</strong> Terraform keeps every attribute the provider knows. The direct engine keeps the job as the CLI sends it to the API.</li>
+<li><strong>The direct engine is faster and simpler.</strong> In my test, 17 s vs 11 s for a deploy with no changes, and no Terraform or provider to download. The Terraform engine needed the internet even when everything was already on my disk.</li>
+<li><strong>Removing a field is usually not the problem.</strong> Both engines reset a removed field, except for the few fields Terraform treats as computed, like <code>retry_on_timeout</code>.</li>
+<li><strong>The real risk is what only the workspace remembers.</strong> Such a value survives on the Terraform engine, and the first deploy on the direct engine resets it. Only the JSON plan tells you which field.</li>
+</ul>
+
+<p>If you're about to migrate, start with the checklist above.</p>
+
+<p>I tested this with Databricks CLI 1.2.1 and 1.26.0, Terraform 1.5.5 and the Databricks Terraform provider 1.117.0, on Databricks Free, in November 2026. The engines are still changing, so check your own versions. (And the product name, just in case.)</p>
+
+<h2>Resources</h2>
+
+<ul>
+<li><a href="https://github.com/agmorka/databricks-bundle-engines">The example repo for this article (GitHub)</a></li>
+<li><a href="https://learn.microsoft.com/en-us/azure/databricks/dev-tools/cli/migrate">Databricks CLI migration guide, legacy to new CLI (Microsoft Learn)</a></li>
+<li><a href="https://stackoverflow.com/questions/79637996/deploying-a-bundle-using-databricks-asset-bundles-dab-in-a-firewall-restricted">Stack Overflow: deploying a bundle with DABs in a firewall-restricted environment</a></li>
+<li><a href="https://github.com/databricks/cli/releases">Databricks CLI releases (GitHub)</a></li>
+<li><a href="https://learn.microsoft.com/en-us/azure/databricks/dev-tools/bundles/direct">Migrate to the direct deployment engine (Microsoft Learn)</a></li>
+<li><a href="https://github.com/databricks/databricks-vscode/issues/911">GitHub issue on installing the Databricks provider offline</a></li>
+</ul>
+
+</body>
+</html>
