@@ -37,7 +37,7 @@
 
 <p>I ran the <code>databricks bundle debug terraform</code> command to check which Terraform and provider versions the Databricks CLI will use.</p>
 
-<p>[IMAGE: output of databricks bundle debug terraform, not in pics folder, insert from Notion]</p>
+<p><img src="images/00_bundle_debug_terraform.png" style="max-width:100%;"></p>
 
 <p>The direct engine calls the APIs directly. (The name gives it away.) Neither Terraform nor the Databricks Terraform provider is needed. According to the Databricks documentation, bundle deployments are up to 40% faster. Both paths in one picture:</p>
 
@@ -94,25 +94,17 @@
 
 <p>Both engines print the same deployment log. First, the CLI builds the wheel. Then it uploads all bundle files, including the wheel, to the workspace. Finally, it deploys the resources and updates the deployment state. Compare the two logs below: apart from the target name, the lines are the same.</p>
 
-<p>[IMAGE: deployment log for tf, not in pics folder, insert from Notion]</p>
-
-<p>[IMAGE: deployment log for direct, not in pics folder, insert from Notion]</p>
-
-<p>The first deploy took 30 s for <code>tf</code> and 12 s for <code>direct</code>. That's not quite fair, because the first <code>tf</code> deploy also downloads Terraform and the provider. So I ran a second deploy with no changes: 17 s vs 11 s. That points in the same direction as the "up to 40%" Databricks mentions, but two runs are not enough to say how large the difference really is.</p>
-
 <p><img src="images/04_deploy-timing-tf.png" style="max-width:100%;"></p>
 
 <p><img src="images/05_deploy-timing-direct.png" style="max-width:100%;"></p>
+
+<p>The first deploy took 30 s for <code>tf</code> and 12 s for <code>direct</code>. That's not quite fair, because the first <code>tf</code> deploy also downloads Terraform and the provider. So I ran a second deploy with no changes: 17 s vs 11 s. That points in the same direction as the "up to 40%" Databricks mentions, but two runs are not enough to say how large the difference really is.</p>
 
 <p><img src="images/06_deploy-timing-tf-nochange.png" style="max-width:100%;"></p>
 
 <p><img src="images/07_deploy-timing-direct-nochange.png" style="max-width:100%;"></p>
 
 <p>During that no-change deploy, my first try with the Terraform engine failed before it touched anything: <code>terraform init</code> couldn't reach <code>registry.terraform.io</code>. The provider was already on my disk, and the lock file pinned its exact version, but Terraform still went to the registry. The second try worked. So the Terraform engine needs the internet on every deploy, not only the first one. The direct engine never talks to the Terraform registry at all.</p>
-
-<p>[IMAGE: registry error, not in pics folder, insert from Notion]</p>
-
-<p>[IMAGE: retry that went through, not in pics folder, insert from Notion]</p>
 
 <h3>Locally: what appears in .databricks/</h3>
 
