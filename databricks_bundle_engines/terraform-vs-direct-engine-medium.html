@@ -49,7 +49,7 @@
 
 <p>My bundle has two identical targets, <code>tf</code> and <code>direct</code>, one for each engine. Each target keeps its own state under <code>.databricks/bundle/&lt;target&gt;/</code>, so I can deploy the same job with both engines and put the results side by side. CLI version 1.2.1 already includes the direct engine, so I picked the engine per command with an environment variable (in PowerShell; in bash, it's <code>DATABRICKS_BUNDLE_ENGINE=direct databricks bundle deploy -t direct</code>):</p>
 
-<p>[GIST 01: create gist from gists/01_deploy_commands.ps1 and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/63392a1677216de9c1e518cb3d3355cd</p>
 
 <p>I also turned the project folder into a Git repository with <code>git init</code>. That's what makes the experiments easy to follow. The CLI keeps its deployment state in a hidden <code>.databricks/</code> folder inside the project. If I commit after every deploy, <code>git diff</code> shows how each deploy changed those files. (There's one catch: by default, Git doesn't see these files at all. I'll explain why after the first deploy.)</p>
 
@@ -67,11 +67,11 @@
 
 <p><code>databricks.yml</code> defines the bundle, the wheel artifact and the two targets:</p>
 
-<p>[GIST 02: create gist from gists/02_databricks.yml and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/2eae02d753a8e6c8960687da3f855845</p>
 
 <p><code>resources/my_job.yml</code> defines the job:</p>
 
-<p>[GIST 03: create gist from gists/03_resources_my_job.yml and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/702833a6034cdffa75c7af6765c5eb17</p>
 
 <p>Notes on the config:</p>
 
@@ -203,11 +203,11 @@ With the Terraform engine, removing a set field from your databricks.yml leaves 
 
 <p>I added one line to <code>resources/my_job.yml</code>:</p>
 
-<p>[GIST 04: create gist from gists/04_timeout_seconds_edit.yml and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/bb93bde7b70e843186cb35c0c0b58d21</p>
 
 <p>Then I deployed both targets and checked the jobs (<code>$tfJob</code> and <code>$directJob</code> hold the two job IDs, which <code>bundle summary</code> prints):</p>
 
-<p>[GIST 05: create gist from gists/05_jobs_get_check.ps1 and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/089d43a96090762fb090629c2a20cde6</p>
 
 <p>Adding a field works the same way on both engines, so nothing surprising here. In the state files, <code>timeout_seconds</code> changed from 0 to 3600 in <code>terraform.tfstate</code>, and a new <code>timeout_seconds</code> line appeared in <code>resources.json</code>.</p>
 
@@ -229,7 +229,7 @@ With the Terraform engine, removing a set field from your databricks.yml leaves 
 
 <p>Then I deleted the line with the extra setting. Before deploying, I asked each engine what it was going to do:</p>
 
-<p>[GIST 06: create gist from gists/06_bundle_plan_commands.ps1 and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/36382a2a74371aa02aa5b21b9d0c9f0a</p>
 
 <p>The <code>tf</code> plan does report a change: an update of <code>my_job</code>. And that was the first surprise of this experiment, because according to the <a href="https://learn.microsoft.com/en-us/azure/databricks/dev-tools/bundles/direct#removed-configuration-settings">docs</a>, the Terraform engine should leave a removed field alone.</p>
 
@@ -272,11 +272,11 @@ With the Terraform engine, removing a set field from your databricks.yml leaves 
 
 <p>I didn't want to guess which fields are computed, and I didn't have to. The Terraform engine had already downloaded the provider, and Terraform can print its schema without going to the internet:</p>
 
-<p>[GIST 07: create gist from gists/07_terraform_schema.ps1 and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/2be10413e91c2e6af1c6a5151cb5b63d</p>
 
 <p>For <code>databricks_job</code>, the list is short. At the top level of the job, only two fields are optional + computed: <code>format</code> and <code>id</code>. The CLI always sets <code>format</code> itself, and <code>id</code> is the job ID, so I can't add and remove either of them. Inside a task, there are a few more, but most of them belong to classic clusters (<code>node_type_id</code>, <code>enable_elastic_disk</code>…) or JAR tasks. The one left for my serverless wheel task is <code>retry_on_timeout</code>. Its default is <code>false</code>, so I set it to <code>true</code> on the task:</p>
 
-<p>[GIST 08: create gist from gists/08_retry_on_timeout_edit.yml and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/f777b045eaf55742306d98f07f439b95</p>
 
 <p>Adding it worked the same way on both engines again. Both jobs got <code>true</code>, <code>retry_on_timeout</code> changed from <code>false</code> to <code>true</code> in <code>terraform.tfstate</code>, and a new line appeared in <code>resources.json</code>.</p>
 
@@ -314,7 +314,7 @@ With the Terraform engine, removing a set field from your databricks.yml leaves 
 
 <h3>Step 1: migrating the state</h3>
 
-<p>[GIST 09: create gist from gists/09_migrate_command.ps1 and paste its URL here, on its own line]</p>
+<p>https://gist.github.com/agmorka/bd51bd16736ca7157edb1a3e29ee4170</p>
 
 <p>This command converts <code>terraform.tfstate</code> into the direct engine's state file, <code>resources.json</code>. It works only on my machine: nothing changes in the workspace until the next deploy.</p>
 
